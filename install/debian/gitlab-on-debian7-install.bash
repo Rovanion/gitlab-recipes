@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Author: Rovanion Luckey
-# App Version: 6.2
-version=6.2
-# This script installs Gitlab 6.2 on a Debian 7 against MySQL and Nginx.
+version=6-3-stable
+shellVersion=v1.7.9
+# This script installs Gitlab $version on a Debian 7 against MySQL and Nginx.
 
 # Bail out if there are any errors
 set -e
@@ -63,7 +63,7 @@ else
 	fi
     fi
     if [[ -z $password ]]; then
-	echo -n "Type the new password for user '$user' followed by [ENTER]. If none is given the default is random: "
+	echo -n "Type the new password for user '$user' followed by [ENTER]. If none is given the default is a random string: "
 	read password
     fi
     if [[ -z $folder ]]; then
@@ -75,7 +75,7 @@ else
 	read domain
     fi
     if [[ -z $rootDBPassword ]]; then
-	echo -n "Type the Password for the root user of the MySQL database followed by [ENTER]: "
+	echo -n "Type the Password for the root user of the MySQL database followed by [ENTER]. The default is to use the same as the user password: "
 	read -s rootDBPassword
     fi
 fi
@@ -91,7 +91,7 @@ if [[ "$password" == "" || -z $password ]]; then
     password=$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM
 fi
 if [[ "$folder" == "" || -z $folder ]]; then
-    folder="/home/$appUser"
+    folder="/home/$user"
 fi
 if [[ "$domain" == "" || -z $domain ]]; then
     echo "The domain name at which the server runs must be specified."
@@ -102,29 +102,38 @@ if [[ "$rootDBPassword" == "" || -z $rootDBPassword ]]; then
 	echo "The password for the root MySQL user must be specified because MySQL is already installed."
 	exit 1;
     else
-	rootDBPassword=$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM
+	rootDBPassword=$password
     fi
 fi
 
 # Adding the user according to http://www.debian-administration.org/articles/668
 useradd --home "$folder" -p $(echo "$password" | openssl passwd -1 -stdin) "$user"
+mkdir "$folder"
+chown "$user":"$user" "$folder"
 cd "$folder"
-echo $folder
 
 ###
 # Dependencies
 ###
+
+# Catch the exit status of dpkg
+mysqlWasInstalled=$(dpkg -s mysql-server &>/dev/null)$?
+
 dependencies="build-essential zlib1g-dev libyaml-dev libssl-dev libgdbm-dev libreadline-dev libncurses5-dev libffi-dev curl git-core openssh-server redis-server checkinstall libxml2-dev libxslt-dev libcurl4-openssl-dev libicu-dev python python-docutils postfix mysql-server mysql-client libmysqlclient-dev nginx"
 apt-get update
 if [[ $auto ]]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get -y upgrade
     apt-get -y install $dependencies
-    mysqladmin -u root password "$rootDBPassword"
+    # Set the root mysql password if we installed it
+    if [[ ! $mysqlWasInstalled ]]; then
+	mysqladmin -u root password "$rootDBPassword"
+    fi
 else
     apt-get upgrade
     apt-get install $dependencies
 fi
+
 
 ###
 # Remove old Ruby and install 2.0
@@ -133,20 +142,21 @@ echo -e "\n\nThe following steps will remove Ruby 1.8 if installed then compile 
 if [[ $auto ]]; then
     apt-get remove -y ruby1.8
 else
-    echo -n "Are you sure you want to compile and install Ruby 2.0? Answer y or n followed by [ENTER]: "
+    echo -n "Are you sure you want to compile and install Ruby 2.0? [Y/n]: "
     read answer
-    if [[ "$answer" != "y" || "$answer" != "Y" ]]; then
-	exit
+    if [[ "$answer" = "n" || "$answer" = "N" || "$answer" = "no" || "$answer" = "No" ]]; then
+	echo "Exiting."
+	exit 1
     fi
     apt-get remove ruby1.8
 fi
 
+cd "$folder"
 curl --progress ftp://ftp.ruby-lang.org/pub/ruby/2.0/ruby-2.0.0-p247.tar.gz | tar xz
 cd ruby-2.0.0-p247
 ./configure
 make
 sudo make install
-cd "$folder"
 
 # Install the ruby gem bundler
 gem install bundler --no-ri --no-rdoc
@@ -155,10 +165,10 @@ gem install bundler --no-ri --no-rdoc
 ###
 # Gitlab Shell
 ###
-sudo -u "$user" -H git clone https://github.com/gitlabhq/gitlab-shell.git
+cd "$folder"
+sudo -u "$user" -H git clone https://github.com/gitlabhq/gitlab-shell.git -b $shellVersion
 cd gitlab-shell
-sudo -u "$user" -H git checkout v1.7.1
-mv config.yml config.yml.old 2>/dev/null
+
 # Automatically edit the config according to the arguments given. "|" is used instead of "/".
 sudo -u "$user" -H sed -r -e "s|user: git|user: $user|" config.yml.example | sed -r -e "s|/home/git|$folder|" >> config.yml
 sudo -u "$user" -H ./bin/install
@@ -167,12 +177,12 @@ sudo -u "$user" -H ./bin/install
 ###
 # MySQL
 ###
-mysql -u root -p"$dbPassword" -Bse "CREATE USER '$user'@'localhost' IDENTIFIED BY '$password'; 
-CREATE DATABASE IF NOT EXISTS `gitlabhq_production` DEFAULT CHARACTER SET `utf8` COLLATE `utf8_unicode_ci`; 
-GRANT SELECT, LOCK TABLES, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON `gitlabhq_production`.* TO '$user'@'localhost';"
+mysql -u root -p"$rootDBPassword" -Bse "CREATE USER '$user'@'localhost' IDENTIFIED BY '$password'; 
+CREATE DATABASE IF NOT EXISTS gitlabhq_production DEFAULT CHARACTER SET utf8 COLLATE utf8_unicode_ci; 
+GRANT SELECT, LOCK TABLES, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON gitlabhq_production.* TO '$user'@'localhost';"
 
 # Test the mysql connection with the new user
-if ! sudo -u "$user" -H mysql -u "$user" -p="$password" -D gitlabhq_production ; then
+if ! sudo -u "$user" -H mysql -u "$user" -p"$password" -D gitlabhq_production -Bse "quit;"; then
     echo "Failed to login as '$user'@'localhost'. Something went wrong with the MySQL setup."
 fi
 
@@ -180,8 +190,9 @@ fi
 ###
 # GitLab and Configuration
 ###
-cd "$folder/gitlab"
-sudo -u "$user" -H git clone https://github.com/gitlabhq/gitlabhq.git gitlab && git checkout 6-2-stable
+cd "$folder"
+sudo -u "$user" -H git clone https://github.com/gitlabhq/gitlabhq.git -b $version gitlab
+cd gitlab
 sudo -u "$user" -H sed -r -e "s|localhost|$domain|" config/gitlab.yml.example | sed -r -e "s|# user: git|user: $user|" | sed -r -e "s|/home/git|$folder|" >> gitlab.yml
 
 chown -R "$user" log/
@@ -210,6 +221,7 @@ sudo -u "$user" -H git config --global core.autocrlf input
 
 # Database config
 sudo -u "$user" -H sed -r -e "s|username: gitlab|username: $user|" config/database.yml.mysql | sed -r -e "s|password: \"secure password\"|password: $password|" >> config/database.yml
+chown "$user":"$user" config/database.yml
 sudo -u "$user" -H chmod o-rwx config/database.yml
 
 
@@ -242,6 +254,7 @@ lib/support/logrotate/gitlab /etc/logrotate.d/gitlab
 sudo -u "$user" -H bundle exec rake gitlab:env:info RAILS_ENV=production
 service gitlab start
 sudo -u "$user" -H bundle exec rake gitlab:check RAILS_ENV=production
+
 
 ###
 # Nginx
